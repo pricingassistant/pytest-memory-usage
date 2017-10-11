@@ -36,11 +36,12 @@ class MemoryState(object):
         self.clear()
 
     def clear(self):
-        self.before_setup = None
-        self.before_call = None
-        self.after_setup = None
-        self.after_call = None
-        self.process = None
+        self.before_setup = {}
+        self.before_call = {}
+        self.after_setup = {}
+        self.after_call = {}
+        self.processes = {}
+        self.memory = {} # per-process memory usage
 
 
 _TWO_20 = float(2 ** 20)
@@ -57,21 +58,22 @@ def get_memory(process, include_children=True):
     except psutil.AccessDenied:
         return None
 
-
-def get_process():
-    pid = os.getpid()
-    return psutil.Process(pid)
+def get_processes():
+    processes = {proc.name(): proc for proc in psutil.process_iter()}
+    return processes
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
     if configuration.getoption('memory_usage') or configuration.getini('memory_usage'):
         state.clear()
-        state.process = get_process()
+        state.processes = get_processes()
         gc.disable()
-        state.before_setup = get_memory(state.process)
+        for name, process in state.processes.iteritems():
+            state.before_setup[name] = get_memory(process)
         yield
-        state.after_setup = get_memory(state.process)
+        for name, process in state.processes.iteritems():
+            state.after_setup[name] = get_memory(process)
         gc.enable()
     else:
         yield
@@ -81,9 +83,11 @@ def pytest_runtest_setup(item):
 def pytest_runtest_call(item):
     if configuration.getoption('memory_usage') or configuration.getini('memory_usage'):
         gc.disable()
-        state.before_call = get_memory(state.process)
+        for name, process in state.processes.iteritems():
+            state.before_call[name] = get_memory(process)
         yield
-        state.after_call = get_memory(state.process)
+        for name, process in state.processes.iteritems():
+            state.after_call[name] = get_memory(process)
         gc.enable()
     else:
         yield
@@ -95,13 +99,22 @@ def pytest_runtest_makereport(item):
         outcome = yield
         report = outcome.get_result()
         memory_usage = 0
-        if (state.before_setup is not None and
-                state.after_setup is not None):
-            memory_usage += state.after_setup - state.before_setup
-        if (state.before_call is not None and
-                state.after_call is not None):
-            memory_usage += state.after_call - state.before_call
-            report.__dict__.update(dict(memory_usage=memory_usage))
+        for name in state.processes:
+            state.memory[name] = 0
+            if (name in state.before_setup and name in state.after_setup):
+                memory = state.after_setup[name] - state.before_setup[name]
+                if memory > 0:
+                    state.memory[name] += memory
+
+            if (name in state.before_call and name in state.after_call):
+                memory = state.after_call[name] - state.before_call[name]
+                if memory > 0:
+                    state.memory[name] += memory
+
+            memory_usage += state.memory[name]
+
+        report.__dict__.update(dict(memory_usage=memory_usage, memory_details=state.memory))
+
     else:
         yield
 
@@ -111,12 +124,15 @@ def pytest_runtest_logreport(report):
     if configuration.getoption('memory_usage') or configuration.getini('memory_usage'):
         if report.when == 'call' and report.passed:
             if hasattr(report, 'memory_usage'):
-                writer.write(' ({memory_usage:.0f}MB'.format(memory_usage=report.memory_usage))
+                writer.write('Total: {memory_usage:.0f}MB'.format(memory_usage=report.memory_usage))
                 if report.memory_usage < 0:
-                    writer.write(' - gc.collect() probably called explicitly')
-                writer.write(')')
-    return None
+                    writer.write(' (gc.collect() probably called explicitly)')
+
+            if hasattr(report, 'memory_details'):
+                for name, memory_usage in report.memory_details.iteritems():
+                    writer.write('  {name}: {memory_usage:.0f}MB'.format(name=name, memory_usage=memory_usage))
+                    if memory_usage < 0:
+                        writer.write(' (gc.collect() probably called explicitly)')
 
 
 state = MemoryState()
-
